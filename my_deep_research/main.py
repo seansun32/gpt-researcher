@@ -15,10 +15,14 @@
     python main.py "AI在医疗领域的最新应用进展" --type detailed_report
 """
 
+import os
+
+# 避免代理拦截本地请求（必须在所有网络请求之前设置）
+os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
+
 import argparse
 import asyncio
 import logging
-import os
 import sys
 
 from dotenv import load_dotenv
