@@ -20,6 +20,9 @@ import os
 # 避免代理拦截本地请求（必须在所有网络请求之前设置）
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
 
+# 防止 tiktoken 尝试从外网下载编码文件（安全兜底）
+os.environ.setdefault('TIKTOKEN_CACHE_DIR', os.path.join(os.path.dirname(__file__), '.tiktoken_cache'))
+
 import argparse
 import asyncio
 import logging
