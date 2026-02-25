@@ -12,8 +12,10 @@
 
 import os
 
-# 避免代理拦截本地请求（必须在所有网络请求之前设置）
-os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
+# 避免代理拦截本地请求（必须在所有网络库 import 之前设置）
+_no_proxy = 'localhost,127.0.0.1'
+os.environ['NO_PROXY'] = _no_proxy
+os.environ['no_proxy'] = _no_proxy
 
 import logging
 from typing import List

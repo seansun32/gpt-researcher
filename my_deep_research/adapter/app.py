@@ -10,8 +10,11 @@
 
 import os
 
-# 避免代理拦截本地请求（必须在所有网络请求之前设置）
-os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
+# 避免代理拦截本地请求（必须在所有网络库 import 之前设置）
+# 同时设置大小写两种形式，兼容 requests / urllib3 / httpx
+_no_proxy = 'localhost,127.0.0.1'
+os.environ['NO_PROXY'] = _no_proxy
+os.environ['no_proxy'] = _no_proxy
 
 import time
 import logging
@@ -87,19 +90,27 @@ async def search(query: str = Query(..., description="搜索关键词")):
         "custom_params": [],
     }
 
+    logger.info(f"[/search] Received query: '{query}'")
+    logger.info(f"[/search] Calling internal API: POST {SEARCH_URL}")
+    logger.debug(f"[/search] Payload: {payload}")
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(SEARCH_URL, json=payload)
+            logger.info(f"[/search] Internal API response status: {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
-        logger.error(f"Internal search API error: {e}")
+        logger.error(f"[/search] Internal search API error: {e}", exc_info=True)
         return []
 
     # 解析内部搜索结果
     hits = data.get("data", {}).get("data", [])
+    logger.info(f"[/search] Parsed {len(hits)} hits from response")
     if not hits:
-        logger.warning(f"No results for query: {query}")
+        # 打印响应结构帮助诊断
+        top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        logger.warning(f"[/search] No results for query: '{query}'. Response top-level keys: {top_keys}")
         return []
 
     results = []
@@ -131,7 +142,9 @@ async def search(query: str = Query(..., description="搜索关键词")):
             "title": title,
         })
 
-    logger.info(f"Query '{query}' → {len(results)} results")
+    logger.info(f"[/search] Query '{query}' → returning {len(results)} results")
+    if results:
+        logger.info(f"[/search]   First result: href={results[0].get('href')}, title={results[0].get('title', '')[:50]}")
     return results
 
 
