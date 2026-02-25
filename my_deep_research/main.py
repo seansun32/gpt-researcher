@@ -71,6 +71,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from gpt_researcher import GPTResearcher  # noqa: E402
+from gpt_researcher.memory.embeddings import Memory  # noqa: E402
 
 from custom_embeddings import InternalEmbeddings  # noqa: E402
 
@@ -79,6 +80,38 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ======================================================================
+# Monkey-patch Memory 类，使 "custom" provider 使用 InternalEmbeddings
+#
+# 问题背景：
+#   默认的 "custom" provider 会创建 OpenAIEmbeddings，向 OPENAI_BASE_URL/embeddings
+#   发请求。但内部 LLM 服务没有 /embeddings 端点，导致 404。
+#
+#   之前的做法是在 main.py 里替换主 researcher 的 memory._embeddings，
+#   但 deep_research 模式会创建子 researcher，每个子 researcher 都重新
+#   初始化 Memory，导致子 researcher 仍然走 OpenAIEmbeddings → 404。
+#
+# 解决方案：
+#   在类级别 patch Memory.__init__，这样所有 researcher 实例（主+子）
+#   创建 Memory 时都会自动使用 InternalEmbeddings，无需修改上游源码。
+# ======================================================================
+_original_memory_init = Memory.__init__
+
+
+def _patched_memory_init(self, embedding_provider, model, **kwargs):
+    if embedding_provider == "custom":
+        self._embeddings = InternalEmbeddings(
+            api_url=os.getenv("INTERNAL_EMBEDDING_URL"),
+            app_id=os.getenv("INTERNAL_EMBEDDING_APP_ID"),
+            model=os.getenv("INTERNAL_EMBEDDING_MODEL"),
+        )
+    else:
+        _original_memory_init(self, embedding_provider, model, **kwargs)
+
+
+Memory.__init__ = _patched_memory_init
+logger.info("Patched Memory class to use InternalEmbeddings for 'custom' provider")
 
 
 def _check_adapter():
@@ -161,30 +194,21 @@ async def run_research(
     )
 
     # ------------------------------------------------------------------
-    # Step 2: 替换 Embedding 为内部实现
-    # ------------------------------------------------------------------
-    internal_embeddings = InternalEmbeddings(
-        api_url=os.getenv("INTERNAL_EMBEDDING_URL"),
-        app_id=os.getenv("INTERNAL_EMBEDDING_APP_ID"),
-        model=os.getenv("INTERNAL_EMBEDDING_MODEL"),
-    )
-    researcher.memory._embeddings = internal_embeddings
-    logger.info("Replaced default embeddings with InternalEmbeddings")
-
-    # ------------------------------------------------------------------
-    # Step 3: 执行研究
+    # Step 2: 执行研究
+    # （Embedding 已通过 Memory 类级别 patch 自动使用 InternalEmbeddings，
+    #   对主 researcher 和 deep_research 创建的子 researcher 均生效）
     # ------------------------------------------------------------------
     logger.info(f"Starting research: '{query}' (type={report_type})")
     await researcher.conduct_research()
 
     # ------------------------------------------------------------------
-    # Step 4: 生成报告
+    # Step 3: 生成报告
     # ------------------------------------------------------------------
     logger.info("Generating report...")
     report = await researcher.write_report()
 
     # ------------------------------------------------------------------
-    # Step 5: 输出统计
+    # Step 4: 输出统计
     # ------------------------------------------------------------------
     costs = researcher.get_costs()
     sources = researcher.get_source_urls()
