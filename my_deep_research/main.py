@@ -16,6 +16,8 @@
 """
 
 import os
+import sys
+import types
 
 # ======================================================================
 # 必须在所有网络库 import 之前设置，避免代理拦截本地请求
@@ -25,15 +27,43 @@ _no_proxy = 'localhost,127.0.0.1'
 os.environ['NO_PROXY'] = _no_proxy
 os.environ['no_proxy'] = _no_proxy
 
-# 防止 tiktoken 尝试从外网下载编码文件（指向本地空目录即可）
-_tiktoken_cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.tiktoken_cache')
-os.makedirs(_tiktoken_cache, exist_ok=True)
-os.environ['TIKTOKEN_CACHE_DIR'] = _tiktoken_cache
+# ======================================================================
+# 注入 fake tiktoken 到 sys.modules，彻底阻止外网下载
+#
+# gpt-researcher 的 costs.py 会 import tiktoken，tiktoken 在调用
+# get_encoding() 时会尝试从 openaipublic.blob.core.windows.net 下载
+# 编码文件。在内网环境中无法访问，导致 ConnectTimeout。
+#
+# 解决方案：在 import gpt_researcher 之前，将一个 fake tiktoken 模块
+# 注入 sys.modules。这样 costs.py 的 `import tiktoken` 拿到的是我们的
+# mock，encode() 返回近似 token 列表，不会发起任何网络请求。
+# ======================================================================
+_fake_tiktoken = types.ModuleType('tiktoken')
+_fake_tiktoken.__package__ = 'tiktoken'
+
+
+class _FakeEncoding:
+    """假编码器：用字符数近似 token 数，避免外网下载真实编码表"""
+    def encode(self, text):
+        if not text:
+            return []
+        cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff'
+                  or '\u3040' <= ch <= '\u30ff'
+                  or '\uac00' <= ch <= '\ud7af')
+        ratio = cjk / len(text) if text else 0
+        count = int(len(text) / 1.5) if ratio > 0.3 else len(text) // 4
+        return [0] * max(1, count)
+
+
+_fake_tiktoken.get_encoding = lambda name: _FakeEncoding()
+_fake_tiktoken.encoding_for_model = lambda model: _FakeEncoding()
+_fake_tiktoken.Encoding = _FakeEncoding
+
+sys.modules['tiktoken'] = _fake_tiktoken
 
 import argparse
 import asyncio
 import logging
-import sys
 
 from dotenv import load_dotenv
 
@@ -43,42 +73,6 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from gpt_researcher import GPTResearcher  # noqa: E402
 
 from custom_embeddings import InternalEmbeddings  # noqa: E402
-
-# ======================================================================
-# Monkey-patch: 替换 gpt_researcher.utils.costs 中的 tiktoken 依赖
-# pip 安装的包不应直接修改，因此在运行时替换费用估算函数，
-# 用简单的字符级近似取代 tiktoken 的精确 token 计数。
-# ======================================================================
-def _patch_costs():
-    """用不依赖 tiktoken 的近似实现替换 costs 模块中的函数"""
-    try:
-        from gpt_researcher.utils import costs as _costs_mod
-
-        def _approx_token_count(text: str) -> int:
-            if not text:
-                return 0
-            cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff'
-                      or '\u3040' <= ch <= '\u30ff'
-                      or '\uac00' <= ch <= '\ud7af')
-            if len(text) > 0 and cjk / len(text) > 0.3:
-                return max(1, int(len(text) / 1.5))
-            return max(1, len(text) // 4)
-
-        def patched_estimate_llm_cost(input_content: str, output_content: str) -> float:
-            inp = _approx_token_count(input_content) * _costs_mod.INPUT_COST_PER_TOKEN
-            out = _approx_token_count(output_content) * _costs_mod.OUTPUT_COST_PER_TOKEN
-            return inp + out
-
-        def patched_estimate_embedding_cost(model: str, docs: list) -> float:
-            total = sum(_approx_token_count(str(d)) for d in docs)
-            return total * _costs_mod.EMBEDDING_COST
-
-        _costs_mod.estimate_llm_cost = patched_estimate_llm_cost
-        _costs_mod.estimate_embedding_cost = patched_estimate_embedding_cost
-    except Exception:
-        pass  # 万一 costs 模块结构变了，不影响主流程
-
-_patch_costs()
 
 logging.basicConfig(
     level=logging.INFO,
