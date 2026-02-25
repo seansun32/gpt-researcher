@@ -72,6 +72,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from gpt_researcher import GPTResearcher  # noqa: E402
 from gpt_researcher.memory.embeddings import Memory  # noqa: E402
+from gpt_researcher.prompts import PromptFamily  # noqa: E402
+from gpt_researcher.skills.deep_research import DeepResearchSkill  # noqa: E402
+from gpt_researcher.utils.llm import create_chat_completion  # noqa: E402
 
 from custom_embeddings import InternalEmbeddings  # noqa: E402
 
@@ -81,20 +84,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ######################################################################
+#                      Monkey-patch 区域
+#
+# 以下 patch 均为类级别替换，对所有 researcher 实例（主+子）自动生效，
+# 无需修改 gpt-researcher 上游源码。
+# ######################################################################
+
 # ======================================================================
-# Monkey-patch Memory 类，使 "custom" provider 使用 InternalEmbeddings
+# Patch 1: Memory 类 —— 使 "custom" provider 使用 InternalEmbeddings
 #
-# 问题背景：
-#   默认的 "custom" provider 会创建 OpenAIEmbeddings，向 OPENAI_BASE_URL/embeddings
-#   发请求。但内部 LLM 服务没有 /embeddings 端点，导致 404。
-#
-#   之前的做法是在 main.py 里替换主 researcher 的 memory._embeddings，
-#   但 deep_research 模式会创建子 researcher，每个子 researcher 都重新
-#   初始化 Memory，导致子 researcher 仍然走 OpenAIEmbeddings → 404。
-#
-# 解决方案：
-#   在类级别 patch Memory.__init__，这样所有 researcher 实例（主+子）
-#   创建 Memory 时都会自动使用 InternalEmbeddings，无需修改上游源码。
+# 默认 "custom" provider 会创建 OpenAIEmbeddings 向 OPENAI_BASE_URL/embeddings
+# 发请求，但内部 LLM 服务没有 /embeddings 端点，导致 404。
 # ======================================================================
 _original_memory_init = Memory.__init__
 
@@ -111,7 +112,135 @@ def _patched_memory_init(self, embedding_provider, model, **kwargs):
 
 
 Memory.__init__ = _patched_memory_init
-logger.info("Patched Memory class to use InternalEmbeddings for 'custom' provider")
+logger.info("Patched Memory.__init__: 'custom' provider → InternalEmbeddings")
+
+# ======================================================================
+# Patch 2: DeepResearchSkill.process_research_results
+#
+# 原始 prompt 让 LLM 输出 "Learning [source_url]: <insight>" 格式，
+# 但内部 LLM 常不严格遵循，导致 citation 提取率低。
+# 改为更明确的、对中文 LLM 友好的 prompt，并强调只使用已有 URL。
+# ======================================================================
+import re  # noqa: E402
+from gpt_researcher.llm_provider.generic.base import ReasoningEfforts  # noqa: E402
+
+
+async def _patched_process_research_results(self, query, context, num_learnings=3):
+    messages = [
+        {"role": "system", "content": "你是一位专业的研究分析师，负责从搜索结果中提取关键发现。"},
+        {"role": "user", "content": f"""请根据以下研究结果，针对查询 "{query}" 提取关键发现和后续问题。
+
+严格要求：
+- 每条发现必须来自下面提供的研究结果，不得编造内容
+- 如果研究结果中包含 "Source:" 开头的 URL，请将该 URL 作为引用来源
+- 如果某条发现没有对应的 URL，则不附加来源，留空即可
+- 绝对不要编造、猜测或生成任何 URL
+
+输出格式（严格遵循，每行一条）：
+Learning [实际URL]: 发现内容
+Learning []: 没有URL时这样写
+Question: 后续问题
+
+研究结果：
+{context}"""}
+    ]
+
+    response = await create_chat_completion(
+        messages=messages,
+        llm_provider=self.researcher.cfg.strategic_llm_provider,
+        model=self.researcher.cfg.strategic_llm_model,
+        temperature=0.4,
+        reasoning_effort=ReasoningEfforts.High.value,
+        max_tokens=1000
+    )
+
+    lines = response.split('\n')
+    learnings = []
+    questions = []
+    citations = {}
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith('Learning'):
+            url_match = re.search(r'\[(.*?)\]:', line)
+            if url_match:
+                url = url_match.group(1).strip()
+                learning = line.split(':', 1)[1].strip() if ':' in line.split(']', 1)[-1] else line
+                # 去掉 "Learning [url]: " 前缀，提取纯内容
+                parts = line.split(']:', 1)
+                if len(parts) == 2:
+                    learning = parts[1].strip()
+                if learning:
+                    learnings.append(learning)
+                    if url and url.startswith('http'):
+                        citations[learning] = url
+            else:
+                learning = line.replace('Learning:', '').replace('Learning', '').strip()
+                if learning:
+                    learnings.append(learning)
+        elif line.startswith('Question:'):
+            questions.append(line.replace('Question:', '').strip())
+
+    return {
+        'learnings': learnings[:num_learnings],
+        'followUpQuestions': questions[:num_learnings],
+        'citations': citations
+    }
+
+
+DeepResearchSkill.process_research_results = _patched_process_research_results
+logger.info("Patched DeepResearchSkill.process_research_results: 改进 citation 提取 prompt")
+
+# ======================================================================
+# Patch 3: 报告生成 prompt —— 禁止编造 URL，禁止添加免责声明
+#
+# 原始 prompt 用 "MUST" 强制要求每处都加 URL 引用，当 context 中 URL
+# 不足时，LLM 会编造 URL 并可能添加"以上链接为示例"的免责声明。
+# ======================================================================
+from datetime import date, datetime, timezone  # noqa: E402
+from gpt_researcher.utils.enum import ReportSource  # noqa: E402
+
+_original_generate_report_prompt = PromptFamily.generate_report_prompt
+_original_generate_deep_research_prompt = PromptFamily.generate_deep_research_prompt
+
+# 通用的引用约束指令（中英双语，确保 LLM 理解）
+_CITATION_CONSTRAINT = """
+CRITICAL CITATION RULES (引用规则 - 必须严格遵守):
+- ONLY use URLs that appear in the provided context/information above. 只使用上文中已有的真实 URL。
+- If a piece of information has no corresponding URL in the context, cite it WITHOUT a URL — just describe the source in text. 如果某条信息没有对应 URL，则不加链接，用文字描述来源即可。
+- NEVER fabricate, guess, or generate any URL. 绝对不要编造、猜测或生成任何 URL。
+- NEVER add disclaimers like "以上链接为示例" or "需替换为真实链接". 绝对不要添加类似"链接为示例"的免责声明。
+- It is better to have NO URL than a fake URL. 没有链接好过假链接。
+"""
+
+
+@staticmethod
+def _patched_generate_report_prompt(
+    question, context, report_source, report_format="apa",
+    total_words=1000, tone=None, language="english",
+):
+    base = _original_generate_report_prompt(
+        question, context, report_source, report_format,
+        total_words, tone, language,
+    )
+    return base + _CITATION_CONSTRAINT
+
+
+@staticmethod
+def _patched_generate_deep_research_prompt(
+    question, context, report_source, report_format="apa",
+    tone=None, total_words=2000, language="english",
+):
+    base = _original_generate_deep_research_prompt(
+        question, context, report_source, report_format,
+        tone, total_words, language,
+    )
+    return base + _CITATION_CONSTRAINT
+
+
+PromptFamily.generate_report_prompt = _patched_generate_report_prompt
+PromptFamily.generate_deep_research_prompt = _patched_generate_deep_research_prompt
+logger.info("Patched PromptFamily report prompts: 禁止编造 URL 和免责声明")
 
 
 def _check_adapter():
