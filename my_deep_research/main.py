@@ -117,28 +117,89 @@ logger.info("Patched Memory.__init__: 'custom' provider → InternalEmbeddings")
 # ======================================================================
 # Patch 2: DeepResearchSkill.process_research_results
 #
-# 原始 prompt 让 LLM 输出 "Learning [source_url]: <insight>" 格式，
-# 但内部 LLM 常不严格遵循，导致 citation 提取率低。
-# 改为更明确的、对中文 LLM 友好的 prompt，并强调只使用已有 URL。
+# 原始实现的两个结构性缺陷：
+#   a) 让 LLM 同时做"提取 learning"和"关联 URL"两件事，LLM 常张冠李戴
+#   b) 用正则从 LLM 输出中提取 URL，格式稍有偏差就丢失
+#
+# 新方案：职责分离
+#   - LLM 只负责提取 learning（它擅长的事）
+#   - citation 匹配由代码完成：先把 context 解析回结构化 source 块，
+#     再用 embedding 余弦相似度把每条 learning 匹配到最相关的源文档 URL
 # ======================================================================
+import math  # noqa: E402
 import re  # noqa: E402
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts  # noqa: E402
 
 
+def _parse_context_to_sources(context_str):
+    """将 pretty_print_docs 输出的扁平文本解析回结构化 source 块。
+
+    输入格式（由 prompts.py 的 pretty_print_docs 生成）：
+        Source: https://example.com
+        Title: Page Title
+        Content: extracted text...
+
+    返回: [{'url': str, 'title': str, 'content': str}, ...]
+    """
+    sources = []
+    if not context_str:
+        return sources
+    # 按 "Source: " 标记拆分（兼容开头和中间）
+    blocks = re.split(r'(?:^|\n)Source: ', context_str)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split('\n', 2)
+        url = lines[0].strip()
+        if not url.startswith('http'):
+            continue
+        title = ''
+        content = ''
+        remaining = '\n'.join(lines[1:]) if len(lines) > 1 else ''
+        title_match = re.search(r'Title:\s*(.*?)(?:\n|$)', remaining)
+        if title_match:
+            title = title_match.group(1).strip()
+        content_match = re.search(r'Content:\s*(.*)', remaining, re.DOTALL)
+        if content_match:
+            content = content_match.group(1).strip()
+        sources.append({'url': url, 'title': title, 'content': content})
+    return sources
+
+
+def _cosine_similarity(vec_a, vec_b):
+    """计算两个向量的余弦相似度。"""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 async def _patched_process_research_results(self, query, context, num_learnings=3):
+    # ------------------------------------------------------------------
+    # Phase 1: 解析 context → 结构化 source 块（保留 URL-content 映射）
+    # ------------------------------------------------------------------
+    sources = _parse_context_to_sources(context)
+    logger.debug(f"Parsed {len(sources)} source blocks from context")
+
+    # ------------------------------------------------------------------
+    # Phase 2: LLM 只负责提取 learning 和后续问题（不要求关联 URL）
+    # ------------------------------------------------------------------
     messages = [
         {"role": "system", "content": "你是一位专业的研究分析师，负责从搜索结果中提取关键发现。"},
         {"role": "user", "content": f"""请根据以下研究结果，针对查询 "{query}" 提取关键发现和后续问题。
 
-严格要求：
+要求：
 - 每条发现必须来自下面提供的研究结果，不得编造内容
-- 如果研究结果中包含 "Source:" 开头的 URL，请将该 URL 作为引用来源
-- 如果某条发现没有对应的 URL，则不附加来源，留空即可
-- 绝对不要编造、猜测或生成任何 URL
+- 不需要标注来源URL（系统会自动匹配）
+- 每条发现应简洁、具体、包含关键数据或事实
 
 输出格式（严格遵循，每行一条）：
-Learning [实际URL]: 发现内容
-Learning []: 没有URL时这样写
+Learning: 发现内容
 Question: 后续问题
 
 研究结果：
@@ -154,42 +215,80 @@ Question: 后续问题
         max_tokens=1000
     )
 
-    lines = response.split('\n')
     learnings = []
     questions = []
-    citations = {}
-
-    for line in lines:
+    for line in response.split('\n'):
         line = line.strip()
         if line.startswith('Learning'):
-            url_match = re.search(r'\[(.*?)\]:', line)
-            if url_match:
-                url = url_match.group(1).strip()
-                learning = line.split(':', 1)[1].strip() if ':' in line.split(']', 1)[-1] else line
-                # 去掉 "Learning [url]: " 前缀，提取纯内容
-                parts = line.split(']:', 1)
-                if len(parts) == 2:
-                    learning = parts[1].strip()
-                if learning:
-                    learnings.append(learning)
-                    if url and url.startswith('http'):
-                        citations[learning] = url
-            else:
-                learning = line.replace('Learning:', '').replace('Learning', '').strip()
-                if learning:
-                    learnings.append(learning)
-        elif line.startswith('Question:'):
-            questions.append(line.replace('Question:', '').strip())
+            # 兼容 "Learning: xxx" 和 "Learning 1: xxx" 等格式
+            content = re.sub(r'^Learning\s*\d*[:：]\s*', '', line).strip()
+            if content:
+                learnings.append(content)
+        elif line.startswith('Question'):
+            content = re.sub(r'^Question\s*\d*[:：]\s*', '', line).strip()
+            if content:
+                questions.append(content)
+
+    learnings = learnings[:num_learnings]
+    questions = questions[:num_learnings]
+
+    # ------------------------------------------------------------------
+    # Phase 3: 用 embedding 相似度将 learning 匹配到源文档 URL
+    #   - 不依赖 LLM 做 URL 关联，用代码精确计算
+    #   - 每条 learning 匹配到与之最相似的 source content
+    # ------------------------------------------------------------------
+    citations = {}
+    if sources and learnings:
+        try:
+            embeddings = InternalEmbeddings(
+                api_url=os.getenv("INTERNAL_EMBEDDING_URL"),
+                app_id=os.getenv("INTERNAL_EMBEDDING_APP_ID"),
+                model=os.getenv("INTERNAL_EMBEDDING_MODEL"),
+            )
+            # 截取 source content 前 500 字符以提高效率和聚焦度
+            source_texts = [s['content'][:500] for s in sources]
+
+            # 在线程中执行同步 embedding 调用，避免阻塞事件循环
+            learning_vecs = await asyncio.to_thread(
+                embeddings.embed_documents, learnings
+            )
+            source_vecs = await asyncio.to_thread(
+                embeddings.embed_documents, source_texts
+            )
+
+            for i, learning in enumerate(learnings):
+                if not learning_vecs[i]:
+                    continue
+                best_sim = 0.0
+                best_url = ''
+                for j, source in enumerate(sources):
+                    if not source_vecs[j]:
+                        continue
+                    sim = _cosine_similarity(learning_vecs[i], source_vecs[j])
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_url = source['url']
+                if best_url and best_sim > 0.35:
+                    citations[learning] = best_url
+                    logger.debug(f"Citation matched (sim={best_sim:.3f}): "
+                                 f"'{learning[:40]}...' → {best_url}")
+                else:
+                    logger.debug(f"No citation match for: '{learning[:40]}...' "
+                                 f"(best_sim={best_sim:.3f})")
+        except Exception as e:
+            logger.warning(f"Embedding citation matching failed, "
+                           f"learnings will have no citations: {e}")
 
     return {
-        'learnings': learnings[:num_learnings],
-        'followUpQuestions': questions[:num_learnings],
+        'learnings': learnings,
+        'followUpQuestions': questions,
         'citations': citations
     }
 
 
 DeepResearchSkill.process_research_results = _patched_process_research_results
-logger.info("Patched DeepResearchSkill.process_research_results: 改进 citation 提取 prompt")
+logger.info("Patched DeepResearchSkill.process_research_results: "
+            "LLM提取learning + embedding匹配citation")
 
 # ======================================================================
 # Patch 3: 报告生成 prompt —— 禁止编造 URL，禁止添加免责声明
